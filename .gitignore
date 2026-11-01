@@ -1,0 +1,33 @@
+# ---- checkpoints and datasets (large, and the imagery is not redistributable)
+weights/
+dataset/
+**/weights/
+**/dataset/
+runs/
+experiments/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+
+# ---- python / editor / OS noise
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- logs and scratch
+*.log
+*.tmp
+*.bak
+*.bkp
+*.tar
+*.tar.gz
+*.tgz
+*.zip

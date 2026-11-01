@@ -1,0 +1,56 @@
+cff-version: 1.2.0
+title: FDS-UNeXT
+message: >-
+  If you use this code, please cite the paper listed in the references below.
+type: software
+authors:
+  - family-names: Zhao
+    given-names: Yuancheng
+    affiliation: Lanzhou University
+  - family-names: Wang
+    given-names: Jie
+    affiliation: Lanzhou University
+  - family-names: Li
+    given-names: Faguo
+    affiliation: Lanzhou University
+  - family-names: Liu
+    given-names: Erte
+    affiliation: Lanzhou University
+  - family-names: Meng
+    given-names: Xiangying
+    affiliation: Lanzhou University
+  - family-names: Chen
+    given-names: Yueyue
+    affiliation: Lanzhou University
+license: Apache-2.0
+repository-code: "https://github.com/<your-account>/FDS-UNeXT"
+abstract: >-
+  Boundary-aware adaptation of two frozen foundation models (SAM 2.1 Hiera-L
+  and DINOv2 ViT-L/14) for four-class rooftop material segmentation at 0.14 m
+  ground sampling distance, with 6.7 M trainable parameters.
+keywords:
+  - rooftop segmentation
+  - boundary-aware segmentation
+  - foundation model adaptation
+  - SAM2
+  - DINOv2
+  - parameter-efficient learning
+references:
+  - type: article
+    title: Boundary-Aware Adaptation of Frozen Foundation Models for Fine-Grained Rooftop Segmentation
+    authors:
+      - family-names: Zhao
+        given-names: Yuancheng
+      - family-names: Wang
+        given-names: Jie
+      - family-names: Li
+        given-names: Faguo
+      - family-names: Liu
+        given-names: Erte
+      - family-names: Meng
+        given-names: Xiangying
+      - family-names: Chen
+        given-names: Yueyue
+    journal: Remote Sensing
+    year: 2026
+    status: submitted
