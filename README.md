@@ -9,7 +9,7 @@ trainable parameters (1.33 % of the 523.1 M total). On the Lanzhou Rooftop
 Material Dataset (LRMD, 0.14 m GSD) it reaches 70.00 % mIoU and 72.92 %
 boundary F-score.
 
-![Architecture of FDS-UNeXT](assets/architecture.png)
+![Architecture of FDS-UNeXT](assets/architecture.webp)
 
 *Architecture. Snowflake markers denote frozen parameters and flame markers
 trainable ones: the two trunks stay frozen, while the 48 Hiera adapters, the
