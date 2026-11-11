@@ -42,7 +42,11 @@ for flag, help_ in [
         ("use_ba", "方案 A 边界注意力门"),
         ("use_boundary_head", "方案 B 辅助边界预测头"),
         ("use_dcn", "方案 C 可变形卷积精炼"),
-        ("use_mlp_head", "MLP 全局语义融合头（评估须与训练一致）")]:
+        ("use_mlp_head", "MLP 全局语义融合头（评估须与训练一致）"),
+        # 单流消融（2026-11-05，评审 P2）：评估构型须与训练一致，
+        # 单流 ckpt 必须带对应的 --no-use_dino / --no-use_sam
+        ("use_dino", "单流消融：--no-use_dino = SAM2-only（与训练一致）"),
+        ("use_sam", "单流消融：--no-use_sam = DINOv2-only（与训练一致）")]:
     parser.add_argument(f"--{flag}", action=argparse.BooleanOptionalAction,
                         default=True, help=help_)
 parser.add_argument("--mlp_fuse_dim", type=int, default=384,
@@ -120,7 +124,9 @@ def main(args):
                      mlp_fuse_dim=args.mlp_fuse_dim,
                      dy_edge_offset=args.dy_edge_offset,
                      hiera_size=args.hiera_size,
-                     dino_size=args.dino_size).to(device)
+                     dino_size=args.dino_size,
+                     use_dino=args.use_dino,
+                     use_sam=args.use_sam).to(device)
     sd = torch.load(args.checkpoint, map_location=device)
     if not args.use_mlp_head:
         # 诊断模式（v3 病理分析）：允许以"关闭 mlp 头"的模型评估训练时

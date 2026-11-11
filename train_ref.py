@@ -35,8 +35,10 @@ from torch.utils.data import DataLoader
 
 from datasets import FullDataset
 from models.sam2unext_ref import SAM2UNeXTRef
+from utils.augment import AugmentConfig
 from utils.metrics import ConfusionMatrix, boundary_f_score
 from utils.split import load_split
+from train_compare import AugTrainSet
 
 WT_K = 31          # 官方 weit 卷积核（显著性检测文献默认值）
 WT_COEF = 5.0
@@ -138,11 +140,23 @@ def main(args):
 
     split = load_split(args.split_path)
     lm = parse_label_mapping(args.label_mapping)
-    train_set = FullDataset(args.train_image_path, args.train_mask_path, 1024,
-                            mode='train', num_classes=args.num_classes,
-                            image_list=split['train']['images'],
-                            gt_list=split['train']['gts'],
-                            label_mapping=lm, augment=None)
+    if args.augment:
+        aug = AugmentConfig(mosaic_close_epochs=args.mosaic_close_epochs,
+                            mosaic_open_epoch=args.mosaic_open_epoch,
+                            copy_paste_prob=args.copy_paste_prob,
+                            res_scale_prob=args.res_scale_prob,
+                            photo_metric=args.photo_metric)
+        train_set = AugTrainSet(args.train_image_path, args.train_mask_path, 1024,
+                                num_classes=args.num_classes,
+                                image_list=split['train']['images'],
+                                gt_list=split['train']['gts'],
+                                augment=aug)
+    else:
+        train_set = FullDataset(args.train_image_path, args.train_mask_path, 1024,
+                                mode='train', num_classes=args.num_classes,
+                                image_list=split['train']['images'],
+                                gt_list=split['train']['gts'],
+                                label_mapping=lm, augment=None)
     val_set = _ImgLabel(FullDataset(
         args.train_image_path, args.train_mask_path, 1024,
         mode='test', num_classes=args.num_classes,
@@ -184,6 +198,8 @@ def main(args):
 
     for epoch in range(1, args.epoch + 1):
         model.train()
+        if getattr(args, 'augment', False):
+            train_set.set_epoch(epoch, args.epoch)
         t0 = time.time()
         loss_sum, n_seen = 0.0, 0
         for batch in train_loader:
@@ -259,4 +275,13 @@ if __name__ == "__main__":
     p.add_argument("--dino_size", type=str, default="large")
     p.add_argument("--norm", type=str, default="gn", choices=["gn", "bn"],
                    help="解码器归一化：gn=数值修正版（默认），bn=官方原样")
+    p.add_argument("--augment", action="store_true",
+                   help="同协议对照用：应用与 train.py 逐字同分布的完整增强 "
+                        "(Mosaic9/Copy-Paste/分辨率模拟/翻转)；默认关闭=官方 "
+                        "flip-only 口径，历史 run 不受影响")
+    p.add_argument("--mosaic_close_epochs", type=int, default=50)
+    p.add_argument("--mosaic_open_epoch", type=int, default=1)
+    p.add_argument("--copy_paste_prob", type=float, default=0.3)
+    p.add_argument("--res_scale_prob", type=float, default=0.5)
+    p.add_argument("--photo_metric", action="store_true")
     main(p.parse_args())

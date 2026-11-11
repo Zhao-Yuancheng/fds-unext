@@ -83,6 +83,12 @@ def build_jobs():
               'hrnet_w32'):
         cmp('roof_cmp', f'roof_{m}_f0', m,
             f'runs/roof_v2/cmp_{m}/best.pth', 'roof', 0)
+    # Same-protocol SegFormer-B2 (full augmentation), five folds: N2 of the
+    # devil's-advocate list asks whether BIoU/HD95 survive protocol matching.
+    for f in range(5):
+        d = 'runs/roof_v2/cmp_segformer_b2_fullaug' + ('' if f == 0 else f'_fold{f}')
+        cmp('fullaug', f'roof_segformer_fullaug_f{f}', 'segformer_b2',
+            d + '/best.pth', 'roof', f)
     # UNetFormer（ckpt 由 train_compare.py 训练产出）
     cmp('roof_cmp', 'roof_unetformer_f0', 'unetformer_r18',
         'runs/roof_v2/cmp_unetformer_r18/best.pth', 'roof', 0)
@@ -159,13 +165,14 @@ def get_model(job, args, device):
         elif name == 'unetpp_r34':
             m = smp.UnetPlusPlus('resnet34', encoder_weights=None, classes=nc)
         elif name == 'attunet_r34':
-            m = AttentionUNet(nc)
+            # pretrained=False：纯评估（ckpt 自带权重），离线集群不连 HF Hub
+            m = AttentionUNet(nc, pretrained=False)
         elif name == 'deeplabv3plus_r50':
             m = smp.DeepLabV3Plus('resnet50', encoder_weights=None, classes=nc)
         elif name == 'segformer_b2':
             m = smp.Segformer('mit_b2', encoder_weights=None, classes=nc)
         elif name == 'hrnet_w32':
-            m = HRNetFCN(nc)
+            m = HRNetFCN(nc, pretrained=False)
         elif name == 'unetformer_r18':
             m = UNetFormer(num_classes=nc, backbone_name='resnet18',
                            pretrained=False)
@@ -314,7 +321,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--group', default='all',
                     choices=['all', 'roof_fds', 'roof_notanh', 'roof_cmp',
-                             'potsdam', 'egcs'])
+                             'fullaug', 'potsdam', 'egcs'])
     ap.add_argument('--only', default='', help='substring filter on job name')
     ap.add_argument('--split', default='test')
     ap.add_argument('--biou_ratio', type=float, default=0.005,

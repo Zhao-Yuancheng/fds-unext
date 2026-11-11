@@ -185,7 +185,8 @@ class FDSUNeXT(nn.Module):
                  pretrained=True, use_fdm=True, use_dysample=True,
                  use_ba=True, use_boundary_head=True, use_dcn=True,
                  use_mlp_head=False, mlp_fuse_dim=384, dy_edge_offset=4.0,
-                 hiera_size="large", dino_size="large"):
+                 hiera_size="large", dino_size="large",
+                 use_dino=True, use_sam=True):
         super().__init__()
         self.use_fdm = use_fdm
         self.use_dysample = use_dysample
@@ -193,51 +194,84 @@ class FDSUNeXT(nn.Module):
         self.use_boundary_head = use_boundary_head
         self.use_dcn = use_dcn
         self.use_mlp_head = use_mlp_head
+        # ===== 单流消融开关（2026-11-05，评审 P2「单流对照」）=====
+        # use_dino=False -> SAM2-only；use_sam=False -> DINOv2-only。
+        # 口径：解码器 / 头 / 边界模块与其余协议与 full 逐字一致，仅移除
+        # 一路编码器流；align*/ds_align*（DINOv2 对齐支路）与 FDM（跨流
+        # 高频注入）随流移除，reduce 输入通道 2c -> c（解码器容量不变，
+        # 控制变量：只换编码器流，不动解码器）。默认双流 = 既有 run 零影响。
+        self.use_dino = use_dino
+        self.use_sam = use_sam
+        # 两路全关 = 无编码器，无意义构型，构造期拦截
+        if not use_dino and not use_sam:
+            raise ValueError(
+                "use_dino 与 use_sam 不能同时为 False（至少保留一路编码器）")
+        # 构造期守卫：FDM 需要 SAM2 与 DINOv2 双流输入，单流 + use_fdm 属
+        # 配置错误（训练/评估协议要求单流显式 --no-use_fdm，冒烟即拦截）
+        if use_fdm and not (use_dino and use_sam):
+            raise ValueError(
+                "use_fdm 需要双主干（FDM 为 SAM2/DINOv2 跨流高频注入）；"
+                "单流消融请传 use_fdm=False（CLI: --no-use_fdm）")
+        if use_mlp_head and not use_dino:
+            # mlp_head 五路输入含 x_d（DINOv2 原始终端特征，Q123/Q132）
+            raise NotImplementedError(
+                "mlp_head 依赖 DINOv2 流的 x_d 输入，SAM2-only 不支持")
 
         # ===== SAM2 Hiera 编码器（冻结 + Adapter 微调；尺寸见规格表）=====
+        # c1-c4 规格无条件解析：DINOv2-only 仍用它定 align 输出通道，
+        # 保证单流与 full 的解码器逐级容量一致（控制变量口径）
         hiera_cfg, (c1, c2, c3, c4) = _HIERA_SPECS[hiera_size]
         dino_name, dino_ch = _DINO_SPECS[dino_size]
-        # device 统一在构造完成后由外部 .to(device) 指定，构建期固定 CPU。
-        # 权重经 _load_hiera_trunk 单独灌入 trunk（附录 Q86）：SAM2 与
-        # SAM2.1 checkpoint 通吃，绕开 build_sam 的全模型严格匹配
-        model = build_sam2(hiera_cfg, device="cpu")
+        if use_sam:
+            # device 统一在构造完成后由外部 .to(device) 指定，构建期固定 CPU。
+            # 权重经 _load_hiera_trunk 单独灌入 trunk（附录 Q86）：SAM2 与
+            # SAM2.1 checkpoint 通吃，绕开 build_sam 的全模型严格匹配
+            model = build_sam2(hiera_cfg, device="cpu")
 
-        for attr in ["sam_mask_decoder", "sam_prompt_encoder", "memory_encoder",
-                     "memory_attention", "mask_downsample",
-                     "obj_ptr_tpos_proj", "obj_ptr_proj"]:
-            delattr(model, attr)
-        del model.image_encoder.neck
+            for attr in ["sam_mask_decoder", "sam_prompt_encoder", "memory_encoder",
+                         "memory_attention", "mask_downsample",
+                         "obj_ptr_tpos_proj", "obj_ptr_proj"]:
+                delattr(model, attr)
+            del model.image_encoder.neck
 
-        self.sam = model.image_encoder.trunk
+            self.sam = model.image_encoder.trunk
 
-        if checkpoint_path:
-            _load_hiera_trunk(self.sam, checkpoint_path)
+            if checkpoint_path:
+                _load_hiera_trunk(self.sam, checkpoint_path)
 
-        for param in self.sam.parameters():
-            param.requires_grad = False
-        
-        self.sam.blocks = nn.Sequential(
-            *[Adapter(block) for block in self.sam.blocks]
-        )
+            for param in self.sam.parameters():
+                param.requires_grad = False
+
+            self.sam.blocks = nn.Sequential(
+                *[Adapter(block) for block in self.sam.blocks]
+            )
+        else:
+            # DINOv2-only：不构建 SAM2（省 ~300M 冻结参数与构建时间）
+            self.sam = None
 
         # ===== DINOv2 编码器（冻结，448x448 -> dino_ch @ 32x32）=====
-        if dinov2_path:
-            self.dino = timm.create_model(
-                dino_name, features_only=True,
-                img_size=(448, 448), pretrained=True,
-                pretrained_cfg_overlay=dict(file=dinov2_path))
-        else:
-            self.dino = timm.create_model(
-                dino_name, features_only=True,
-                img_size=(448, 448), pretrained=pretrained)
-        for param in self.dino.parameters():
-            param.requires_grad = False
+        if use_dino:
+            if dinov2_path:
+                self.dino = timm.create_model(
+                    dino_name, features_only=True,
+                    img_size=(448, 448), pretrained=True,
+                    pretrained_cfg_overlay=dict(file=dinov2_path))
+            else:
+                self.dino = timm.create_model(
+                    dino_name, features_only=True,
+                    img_size=(448, 448), pretrained=pretrained)
+            for param in self.dino.parameters():
+                param.requires_grad = False
 
-        # ===== 通道对齐（DINOv2 dino_ch -> 各 Stage 通道数）=====
-        self.align1 = nn.Conv2d(dino_ch, c1, 1)
-        self.align2 = nn.Conv2d(dino_ch, c2, 1)
-        self.align3 = nn.Conv2d(dino_ch, c3, 1)
-        self.align4 = nn.Conv2d(dino_ch, c4, 1)
+            # ===== 通道对齐（DINOv2 dino_ch -> 各 Stage 通道数）=====
+            self.align1 = nn.Conv2d(dino_ch, c1, 1)
+            self.align2 = nn.Conv2d(dino_ch, c2, 1)
+            self.align3 = nn.Conv2d(dino_ch, c3, 1)
+            self.align4 = nn.Conv2d(dino_ch, c4, 1)
+        else:
+            # SAM2-only：不构建 DINOv2（离线集群不触发 timm/HF 下载），
+            # align1-4 / ds_align* 随流移除，forward 走单路分支
+            self.dino = None
 
         # ===== 改进一：FDM（32x32 上做频率分解与高频注入）=====
         if use_fdm:
@@ -256,7 +290,8 @@ class FDSUNeXT(nn.Module):
         # dy_edge_offset（R3-DY，Q124 贴边探针后续）：贴边四模块
         #   （ds_align1a/1b/2 与 up1.up——探针实测 EDGE 饱和 93-99%）
         #   的偏移预算；默认 4.0 = 既有 run 逐字（上限 2 LR 像素）
-        if use_dysample:
+        # ds_align* 属 DINOv2 对齐支路：SAM2-only 随流移除（DINOv2-only 保留）
+        if use_dysample and use_dino:
             self.ds_align1a = DySample(c1, scale=4,
                                        offset_pixels=dy_edge_offset)
             self.ds_align1b = DySample(c1, scale=2,
@@ -265,11 +300,12 @@ class FDSUNeXT(nn.Module):
                                       offset_pixels=dy_edge_offset)
             self.ds_align3 = DySample(c3, scale=2)  # 32 -> 64
 
-        # ===== 融合降维 =====
-        self.reduce1 = nn.Conv2d(2 * c1, 128, 1)
-        self.reduce2 = nn.Conv2d(2 * c2, 128, 1)
-        self.reduce3 = nn.Conv2d(2 * c3, 128, 1)
-        self.reduce4 = nn.Conv2d(2 * c4, 128, 1)
+        # ===== 融合降维（单流消融：恰一路编码器时输入通道 2c -> c）=====
+        _m = 1 if (use_dino != use_sam) else 2
+        self.reduce1 = nn.Conv2d(_m * c1, 128, 1)
+        self.reduce2 = nn.Conv2d(_m * c2, 128, 1)
+        self.reduce3 = nn.Conv2d(_m * c3, 128, 1)
+        self.reduce4 = nn.Conv2d(_m * c4, 128, 1)
 
         # ===== UNet 解码器（Up 内 DySample）=====
         # up1.up 为贴边四模块之一（R3-DY 预算候选，见 ds_align 段注释）；
@@ -314,38 +350,60 @@ class FDSUNeXT(nn.Module):
                 "mlp 线已终止存档，见《MLP融合头研究存档.md》）")
 
     def forward(self, x, with_boundary=False):
-        # 编码器
-        x1_s, x2_s, x3_s, x4_s = self.sam(x)
-        x_d = self.dino(F.interpolate(x, size=(448, 448), mode='bilinear'))[-1]
+        # 编码器（单流消融：SAM2-only 跳过 DINOv2 流；DINOv2-only 跳过
+        # SAM2 流；被跳过支路的变量不定义，融合处按 None 分支）
+        if self.sam is not None:
+            x1_s, x2_s, x3_s, x4_s = self.sam(x)
+        if self.dino is not None:
+            x_d = self.dino(F.interpolate(x, size=(448, 448),
+                                          mode='bilinear'))[-1]
 
-        d1 = self.align1(x_d)
-        d2 = self.align2(x_d)
-        d3 = self.align3(x_d)
-        d4 = self.align4(x_d)
+            d1 = self.align1(x_d)
+            d2 = self.align2(x_d)
+            d3 = self.align3(x_d)
+            d4 = self.align4(x_d)
 
-        # 改进一：FDM（高频注入前置在 DINOv2 原始 32x32 分辨率，附录 Q57）
-        if self.use_fdm:
-            x1_s, d1 = self.fdm1(x1_s, d1)
-            x2_s, d2 = self.fdm2(x2_s, d2)
-            x3_s, d3 = self.fdm3(x3_s, d3)
-            x4_s, d4 = self.fdm4(x4_s, d4)
+            # 改进一：FDM（高频注入前置在 DINOv2 原始 32x32 分辨率，附录 Q57）
+            # （构造期守卫保证 FDM 仅存在于双流构型，此处 SAM 流必在）
+            if self.use_fdm:
+                x1_s, d1 = self.fdm1(x1_s, d1)
+                x2_s, d2 = self.fdm2(x2_s, d2)
+                x3_s, d3 = self.fdm3(x3_s, d3)
+                x4_s, d4 = self.fdm4(x4_s, d4)
 
-        # 改进二：DINOv2 空间对齐上采样
-        if self.use_dysample:
-            x1_d = self.ds_align1b(self.ds_align1a(d1))   # 32 -> 128 -> 256
-            x2_d = self.ds_align2(d2)                     # 32 -> 128
-            x3_d = self.ds_align3(d3)                     # 32 -> 64
+            # 改进二：DINOv2 空间对齐上采样
+            if self.use_dysample:
+                x1_d = self.ds_align1b(self.ds_align1a(d1))   # 32 -> 128 -> 256
+                x2_d = self.ds_align2(d2)                     # 32 -> 128
+                x3_d = self.ds_align3(d3)                     # 32 -> 64
+            elif self.sam is not None:
+                x1_d = F.interpolate(d1, size=x1_s.shape[-2:], mode='bilinear')
+                x2_d = F.interpolate(d2, size=x2_s.shape[-2:], mode='bilinear')
+                x3_d = F.interpolate(d3, size=x3_s.shape[-2:], mode='bilinear')
+            else:
+                # DINOv2-only 回退（无 x*_s 可参照尺寸）：按 1024 输入的
+                # Hiera 各 stage 固定目标尺寸（256/128/64）
+                x1_d = F.interpolate(d1, size=(256, 256), mode='bilinear')
+                x2_d = F.interpolate(d2, size=(128, 128), mode='bilinear')
+                x3_d = F.interpolate(d3, size=(64, 64), mode='bilinear')
+            x4_d = d4                                        # 32x32 恒等
+
+        # 融合 + 解码（单流：单路直降维；双流：cat 融合——原逻辑逐字保留）
+        if self.dino is None:                    # SAM2-only
+            x1 = self.reduce1(x1_s)
+            x2 = self.reduce2(x2_s)
+            x3 = self.reduce3(x3_s)
+            x4 = self.reduce4(x4_s)
+        elif self.sam is None:                   # DINOv2-only
+            x1 = self.reduce1(x1_d)
+            x2 = self.reduce2(x2_d)
+            x3 = self.reduce3(x3_d)
+            x4 = self.reduce4(x4_d)
         else:
-            x1_d = F.interpolate(d1, size=x1_s.shape[-2:], mode='bilinear')
-            x2_d = F.interpolate(d2, size=x2_s.shape[-2:], mode='bilinear')
-            x3_d = F.interpolate(d3, size=x3_s.shape[-2:], mode='bilinear')
-        x4_d = d4                                        # 32x32 恒等
-
-        # 融合 + 解码
-        x1 = self.reduce1(torch.cat([x1_s, x1_d], dim=1))
-        x2 = self.reduce2(torch.cat([x2_s, x2_d], dim=1))
-        x3 = self.reduce3(torch.cat([x3_s, x3_d], dim=1))
-        x4 = self.reduce4(torch.cat([x4_s, x4_d], dim=1))
+            x1 = self.reduce1(torch.cat([x1_s, x1_d], dim=1))
+            x2 = self.reduce2(torch.cat([x2_s, x2_d], dim=1))
+            x3 = self.reduce3(torch.cat([x3_s, x3_d], dim=1))
+            x4 = self.reduce4(torch.cat([x4_s, x4_d], dim=1))
 
         # 方案 A：浅层 skip 特征边界增强（x3/x4 深层不加，附录约束）
         if self.use_ba:

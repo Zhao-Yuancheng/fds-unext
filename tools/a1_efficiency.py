@@ -63,23 +63,27 @@ def build_cmp(name, nc=4):
     raise SystemExit(f'unknown cmp model {name}')
 
 
-def measure(model, device, warmup=10, iters=30):
+def measure(model, device, warmup=10, iters=30, amp=False):
     torch.backends.cudnn.benchmark = True
     x = torch.randn(1, 3, 1024, 1024, device=device)
+    ctx = torch.autocast('cuda', dtype=torch.float16, enabled=amp)
     model.eval()
     with torch.no_grad():
         for _ in range(warmup):
-            model(x)
+            with ctx:
+                model(x)
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
         for _ in range(iters):
-            model(x)
+            with ctx:
+                model(x)
         torch.cuda.synchronize()
         dt = (time.perf_counter() - t0) / iters
         peak_mib = torch.cuda.max_memory_allocated() / 2 ** 20
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                     with_flops=True) as prof:
+        with torch.no_grad(), ctx, profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                with_flops=True) as prof:
             model(x)
     flops = sum(ev.flops for ev in prof.key_averages())
     return {
@@ -99,6 +103,10 @@ def main():
     ap.add_argument('--warmup', type=int, default=10)
     ap.add_argument('--iters', type=int, default=30)
     ap.add_argument('--out', default='runs/a1_efficiency')
+    ap.add_argument('--amp', action='store_true',
+                    help='fp16 autocast 推理测速（默认 fp32）')
+    ap.add_argument('--only', default=None,
+                    help='仅测名称包含该子串的模型（如 "FDS-UNeXT (full)"）')
     ap.add_argument('--fds_variant', action='append', default=[],
                     help='label|hiera_path|dino_path|nc|hiera_size|dino_size '
                          '(repeatable, full cfg; sizes: large/base_plus/tiny, '
@@ -125,10 +133,12 @@ def main():
     results = {}
     print('model\tparams(M)\tGFLOPs\tFPS\tlatency(ms)\tpeakVRAM(MiB)', flush=True)
     for name, fn in specs:
+        if args.only and args.only not in name:
+            continue
         model = None
         try:
             model = fn().to(device)
-            row = measure(model, device, args.warmup, args.iters)
+            row = measure(model, device, args.warmup, args.iters, amp=args.amp)
             results[name] = row
             print(f"{name}\t{row['params_M']}\t{row['gflops']}\t{row['fps']}"
                   f"\t{row['latency_ms']}\t{row['peak_vram_MiB']}", flush=True)

@@ -7,27 +7,45 @@ authors:
   - family-names: Zhao
     given-names: Yuancheng
     affiliation: Lanzhou University
+    orcid: "https://orcid.org/0009-0000-4718-3156"
   - family-names: Wang
     given-names: Jie
     affiliation: Lanzhou University
+    orcid: "https://orcid.org/0000-0003-3401-995X"
   - family-names: Li
     given-names: Faguo
     affiliation: Lanzhou University
+    orcid: "https://orcid.org/0009-0003-9578-4732"
   - family-names: Liu
     given-names: Erte
     affiliation: Lanzhou University
+    orcid: "https://orcid.org/0009-0007-6771-5704"
   - family-names: Meng
     given-names: Xiangying
     affiliation: Lanzhou University
+    orcid: "https://orcid.org/0009-0005-3247-0685"
   - family-names: Chen
     given-names: Yueyue
     affiliation: Lanzhou University
+    orcid: "https://orcid.org/0009-0005-8013-2525"
+  - family-names: Yang
+    given-names: Jiapeng
+    affiliation: Lanzhou University
+    orcid: "https://orcid.org/0009-0008-5965-3379"
+  - family-names: Zhou
+    given-names: Yibo
+    affiliation: Lanzhou University
+    orcid: "https://orcid.org/0009-0005-1347-0700"
+  - family-names: Li
+    given-names: Qingxue
+    affiliation: Lanzhou University
+    orcid: "https://orcid.org/0009-0008-6053-5185"
 license: Apache-2.0
-repository-code: "https://github.com/<your-account>/FDS-UNeXT"
+repository-code: "https://github.com/Zhao-Yuancheng/fds-unext"
 abstract: >-
   Boundary-aware adaptation of two frozen foundation models (SAM 2.1 Hiera-L
   and DINOv2 ViT-L/14) for four-class rooftop material segmentation at 0.14 m
-  ground sampling distance, with 6.7 M trainable parameters.
+  ground sampling distance, with 6.97 M trainable parameters (1.33% of 523.1 M).
 keywords:
   - rooftop segmentation
   - boundary-aware segmentation
@@ -37,7 +55,9 @@ keywords:
   - parameter-efficient learning
 references:
   - type: article
-    title: Boundary-Aware Adaptation of Frozen Foundation Models for Fine-Grained Rooftop Segmentation
+    title: >-
+      Boundary Fidelity in Frozen Foundation-Model Adaptation: When It Holds
+      and When It Fails for Fine-Grained Rooftop Segmentation
     authors:
       - family-names: Zhao
         given-names: Yuancheng
@@ -51,6 +71,12 @@ references:
         given-names: Xiangying
       - family-names: Chen
         given-names: Yueyue
+      - family-names: Yang
+        given-names: Jiapeng
+      - family-names: Zhou
+        given-names: Yibo
+      - family-names: Li
+        given-names: Qingxue
     journal: Remote Sensing
     year: 2026
     status: submitted

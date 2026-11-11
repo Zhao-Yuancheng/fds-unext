@@ -38,6 +38,9 @@ parser.add_argument("--num_classes", type=int, default=4,
                          "公共数据集显式指定，如二值传 2）")
 parser.add_argument("--boundary_weight", type=float, default=0.2,
                     help="β 初值；uncertainty 开启时仅为 precision_b 初值（附录 Q28）")
+parser.add_argument("--weit_coeff", type=float, default=5.0,
+                    help="wBCE weit 边界系数（0 = weit≡1 退化为纯 CE，nosup "
+                         "消融开关；默认 5 = 既有行为。2026-11-03 评审 P0-1A 新增）")
 parser.add_argument("--warmup_epochs", type=int, default=0,
                     help="epoch 门轮数，0 = epoch//2（附录 Q19）")
 parser.add_argument("--adaptive", action=argparse.BooleanOptionalAction, default=True,
@@ -61,6 +64,16 @@ parser.add_argument("--use_boundary_head", action=argparse.BooleanOptionalAction
                     default=True, help="方案 B 辅助边界预测头")
 parser.add_argument("--use_dcn", action=argparse.BooleanOptionalAction, default=True,
                     help="方案 C 可变形卷积精炼")
+# ---- 单流消融（2026-11-05，评审 P2「单流对照」；详见 models/fds_unext.py）----
+# 与结构开关同风格：默认双流 = 既有 run 零影响；单流必须同时 --no-use_fdm
+parser.add_argument("--use_dino", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="单流消融：--no-use_dino = SAM2-only（DINOv2 流与 "
+                         "align/ds_align 支路整体移除，FDM 须同时关闭）")
+parser.add_argument("--use_sam", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="单流消融：--no-use_sam = DINOv2-only（不构建 SAM2 "
+                         "编码器；解码器容量与 full 一致）")
 parser.add_argument("--use_mlp_head", action=argparse.BooleanOptionalAction,
                     default=False,
                     help="MLP 全局语义融合头（Q123，零初始化 logit 并联）")
@@ -100,6 +113,9 @@ parser.add_argument("--label_mapping", type=str, default=None,
 parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False,
                     help="混合精度训练（V100 fp16 加速约 2x；首次基线"
                          "建议 fp32 复现，验证收敛后再开启）")
+parser.add_argument("--fp32_forward", action="store_true",
+                    help="诊断用：真正关闭 autocast（绕开 bool(scaler) 恒真）。"
+                         "默认关闭，历史 run 行为不变")
 parser.add_argument("--clip_grad", type=float, default=1.0,
                     help="梯度范数裁剪上限（inf norm），0 = 关闭。默认"
                          "开启：无裁剪时单步梯度尖峰会永久 NaN 化权重且"
@@ -265,8 +281,11 @@ def run_pass(model, loader, criterion, device, epoch, args, optim=None,
     # 注意（论文 §3.5.2 已披露）：这里用 bool(scaler) 判定 autocast，而
     # GradScaler 只要创建即为真——因此无论 --amp 是否开启，前向都在 fp16
     # 下执行，参数/梯度/优化器状态仍为 fp32。论文报告的所有数值都在这一
-    # 状态下得到；若需要真正的 fp32 前向，应改为 enabled=args.amp。
-    amp_ctx = torch.amp.autocast('cuda', enabled=bool(scaler))
+    # 状态下得到。--fp32_forward 仅用于精度对照 run：显式关闭 autocast，
+    # 默认 False 时行为与历史 run 完全一致。
+    fp32_forward = getattr(args, 'fp32_forward', False)
+    amp_ctx = torch.amp.autocast('cuda',
+                                 enabled=bool(scaler) and not fp32_forward)
     loss_sum, aux_sum, n_seen, nan_skips, consec_bad = 0.0, 0.0, 0, 0, 0
     canary_used = 0
     traced = False
@@ -610,7 +629,9 @@ def main(args):
                      mlp_fuse_dim=args.mlp_fuse_dim,
                      dy_edge_offset=args.dy_edge_offset,
                      hiera_size=args.hiera_size,
-                     dino_size=args.dino_size).to(device)
+                     dino_size=args.dino_size,
+                     use_dino=args.use_dino,
+                     use_sam=args.use_sam).to(device)
     if args.use_mlp_head:
         _n_mlp = sum(p.numel() for p in model.mlp_head.parameters())
         print(f"[mlp_head] fuse_dim={args.mlp_fuse_dim} "
@@ -628,6 +649,7 @@ def main(args):
             break
     criterion = CombinedLoss(num_classes=args.num_classes,
                              boundary_weight=args.boundary_weight,
+                             weit_coeff=args.weit_coeff,
                              warmup_epochs=warmup,
                              adaptive=args.adaptive,
                              dice_start=args.dice_start,

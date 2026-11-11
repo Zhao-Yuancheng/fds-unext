@@ -36,12 +36,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import torchvision.transforms.functional as TF
 
 import timm
 import segmentation_models_pytorch as smp
 
 from datasets import FullDataset
 from models.unetformer import UNetFormer
+from models.segnext import SegNeXt
+from utils.augment import (AugmentConfig, apply_isometric, mosaic9_compose,
+                           photometric_gain, random_res_scale)
 from utils.metrics import ConfusionMatrix, boundary_f_score
 
 
@@ -87,11 +91,15 @@ class _UpAG(nn.Module):
 
 
 class AttentionUNet(nn.Module):
-    """Attention U-Net（ResNet34 编码器 + 注意力门跳跃连接）。"""
+    """Attention U-Net（ResNet34 编码器 + 注意力门跳跃连接）。
 
-    def __init__(self, num_classes, encoder='resnet34'):
+    pretrained=False 供纯评估路径使用（ckpt 自带全部权重，离线集群
+    不必连 HF Hub 下载 ImageNet 预训练，2026-11-05 gpu1 断链教训）。
+    """
+
+    def __init__(self, num_classes, encoder='resnet34', pretrained=True):
         super().__init__()
-        self.enc = timm.create_model(encoder, pretrained=True,
+        self.enc = timm.create_model(encoder, pretrained=pretrained,
                                      features_only=True,
                                      out_indices=(0, 1, 2, 3, 4))
         c = self.enc.feature_info.channels()      # /2,/4,/8,/16,/32
@@ -121,9 +129,10 @@ class HRNetFCN(nn.Module):
     复刻其 stem + stages 调用取分支输出，再按官方 FCN 头（1×1 conv +
     双线性上采样）出全分辨率 logits。"""
 
-    def __init__(self, num_classes, variant='hrnet_w32'):
+    def __init__(self, num_classes, variant='hrnet_w32', pretrained=True):
         super().__init__()
-        self.body = timm.create_model(variant, pretrained=True)
+        # pretrained=False 供纯评估路径（同 AttentionUNet 注释）
+        self.body = timm.create_model(variant, pretrained=pretrained)
         with torch.no_grad():          # 探测 HRNetV2 拼接通道数
             fl = self._features(torch.zeros(1, 3, 256, 256))
         self.head = nn.Conv2d(sum(f.shape[1] for f in fl), num_classes, 1)
@@ -162,10 +171,14 @@ MODEL_ZOO = {
     # UNetFormer（Wang et al., 2022, ResNet18 主干）；协议与其他 CNN 对照一致
     'unetformer_r18': dict(desc='UNetFormer (ResNet18)', lr=1e-4, batch=4,
                            wd=1e-4),
+    # SegNeXt-T：官方 ADE20K 配方 lr 6e-5 / wd 1e-2；batch 4 与 SegFormer 对齐
+    'segnext_t': dict(desc='SegNeXt-T (MSCAN-T)', lr=6e-5, batch=4,
+                      wd=1e-2),
 }
 
 
-def build_model(name, num_classes=4):
+def build_model(name, num_classes=4, abl=False):
+    """对比模型工厂。abl=True 时给 SegFormer 挂边界头（P2 边界感知基线）。"""
     if name == 'unet_r34':
         return smp.Unet('resnet34', encoder_weights='imagenet',
                         classes=num_classes)
@@ -178,14 +191,97 @@ def build_model(name, num_classes=4):
         return smp.DeepLabV3Plus('resnet50', encoder_weights='imagenet',
                                  classes=num_classes)
     if name == 'segformer_b2':
-        return smp.Segformer('mit_b2', encoder_weights='imagenet',
-                             classes=num_classes)
+        m = smp.Segformer('mit_b2', encoder_weights='imagenet',
+                          classes=num_classes)
+        return SegFormerABL(m, num_classes) if abl else m
     if name == 'hrnet_w32':
         return HRNetFCN(num_classes)
     if name == 'unetformer_r18':
         return UNetFormer(num_classes=num_classes, backbone_name='resnet18',
                           pretrained=True)
+    if name == 'segnext_t':
+        ckpt = None
+        for cand in ('weights/segnext_t_ade20k.pth',
+                     'weights/segnext_t_geonusaf.pth',
+                     'weights/mscan_t.pth',
+                     'pretrained/mscan_t.pth'):
+            if os.path.isfile(cand):
+                ckpt = cand
+                break
+        if ckpt is None:
+            print('[segnext] WARNING: no pretrained checkpoint found; '
+                  'this run would not be a fair pretrained baseline',
+                  flush=True)
+        return SegNeXt(num_classes=num_classes, pretrained=ckpt)
     raise SystemExit(f"未知模型 {name}；可选：{list(MODEL_ZOO)}")
+
+
+class SegFormerABL(nn.Module):
+    """SegFormer-B2 + 轻量边界头（P2 边界感知基线，2026-11-05）。
+
+    动机（评审 R1-MAJOR）：论文主张边界优越，但 7 个比较器全是区域导向模型，
+    从未与边界感知设计对照。本包装给最强对照 SegFormer-B2 加上边界监督，
+    使"架构优势"与"是否做边界监督"两个因素可分离。
+
+    设计（ABL 思想的可行简化，引用 wang2022abl）：
+      - 边界头 bhead 从主 logits 派生 1 通道边界 logit（不侵入 smp 内部特征，
+        计算量可忽略：1x1 -> 3x3 -> 1x1）
+      - 边界 GT = 逐类 3x3 膨胀 − 腐蚀 的并集（与 FDS 的 boundary_head_loss 同定义）
+      - 损失 = BCEWithLogits(bhead, GT_b) 按 **到 GT 边界的切比雪夫距离加权**
+        （w = 1 + alpha * d/d_max，上限 20 步）：离真值边界越远的预测边界
+        单元被惩罚越重，即 ABL "把错位边界拉回"的核心机制
+      - 这是 re-implementation，不是原论文逐行复刻；论文中如实标注
+    """
+
+    def __init__(self, segformer, num_classes):
+        super().__init__()
+        self.seg = segformer
+        self.bhead = nn.Sequential(
+            nn.Conv2d(num_classes, 16, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 1))
+
+    def forward(self, x):
+        logits = self.seg(x)
+        return logits, self.bhead(logits)
+
+
+def boundary_band(target, kernel_size=3):
+    """逐类 3x3 膨胀-腐蚀边界带（与 FDS 的 extract_boundary 同定义）。"""
+    nc = int(target.max().item()) + 1 if target.numel() else 1
+    nc = max(nc, 2)
+    t = target.squeeze(1).long()
+    onehot = F.one_hot(t, nc).permute(0, 3, 1, 2).float()
+    k = dict(kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+    dilated = F.max_pool2d(onehot, **k)
+    eroded = -F.max_pool2d(-onehot, **k)
+    return ((dilated - eroded).sum(dim=1, keepdim=True) > 0).float()
+
+
+def dist_to_band(band, iters=20):
+    """到边界带的切比雪夫距离（以 3x3 膨胀步数计，上限 iters）。
+
+    用迭代 max_pool 近似欧氏距离变换：GPU 上无需 scipy/cv2，且只作用于
+    无需梯度的 GT，开销很小（20 次 3x3 pooling）。
+    """
+    dist = torch.zeros_like(band)
+    cur = band.clone()
+    for i in range(1, iters + 1):
+        nxt = F.max_pool2d(cur, 3, 1, 1)
+        newly = (nxt > 0) & (cur == 0)
+        dist = dist + newly.float() * i
+        cur = nxt
+        if bool((cur > 0).all()):
+            break
+    return dist
+
+
+def abl_loss(bnd_logits, target, alpha=2.0, iters=20):
+    """距离加权边界 BCE（ABL 简化实现）。"""
+    gt_b = boundary_band(target)
+    gt_b = F.interpolate(gt_b, size=bnd_logits.shape[-2:], mode='nearest')
+    d = dist_to_band(gt_b, iters=iters)
+    w = 1.0 + alpha * d / float(iters)
+    return F.binary_cross_entropy_with_logits(bnd_logits, gt_b, weight=w)
 
 
 # ---------------------------------------------------------------- 工具
@@ -230,10 +326,71 @@ class FlipTrainSet(FullDataset):
                 'label': label.contiguous()}
 
 
+class AugTrainSet(FullDataset):
+    """对比模型完整增强训练集（批 B / P2-2，2026-11-04，评审 DA-C2）。
+
+    与 FlipTrainSet 同为 mode='test' 底座（跳过 SDF 预计算与缓存——对比
+    模型不用 SDF，避免逐类 SDF 的 RAM 占用与每样本重算开销），但应用与
+    train.py 的 FullDataset(mode='train', augment=...) 完全同分布的动态
+    增强管线：Mosaic9 → 稀有类 Copy-Paste → 1.25x/0.8x 分辨率模拟 →
+    翻转/rot90 → 光度增益。与 train.py 的唯一差别是不计算/返回 SDF
+    （对比模型经 _collate 本就丢弃该字段），增强分布逐字一致。
+
+    注意：FullDataset 只在 mode='train' 时自动构建 Copy-Paste 的稀有类
+    索引（_tiles_with_class），这里在 __init__ 手动补建（逐张读 native
+    标签取 unique，一次性开销，241 张 1024^2 约数十秒）。
+    """
+
+    def __init__(self, image_root, gt_root, size, num_classes,
+                 image_list=None, gt_list=None, augment=None):
+        super().__init__(image_root, gt_root, size, mode='test',
+                         num_classes=num_classes, image_list=image_list,
+                         gt_list=gt_list, augment=augment)
+        if augment is not None and augment.copy_paste:
+            for i, p in enumerate(self.gts):
+                for c in np.unique(self._gt_array(p)):
+                    self._tiles_with_class.setdefault(int(c), []).append(i)
+
+    def __getitem__(self, idx):
+        # 管线与 FullDataset._augment 逐步对应（除 SDF）；rng=random 与
+        # train.py 相同（worker 经 seed_worker 播种，随机流同源）
+        image, label = self._load_pair(idx)
+        aug = self.augment
+        rng = random
+        if self._mosaic_active() and rng.random() < aug.mosaic_prob:
+            pairs = [(image, label)]
+            pairs += [self._load_pair(rng.randrange(len(self)))
+                      for _ in range(8)]
+            image, label = mosaic9_compose(pairs, self.size, rng,
+                                           aug.mosaic_scale)
+        if aug.copy_paste and rng.random() < aug.copy_paste_prob:
+            out = self._apply_copy_paste(image, label, rng)
+            if out is not None:
+                image, label = out
+        if aug.res_scale and rng.random() < aug.res_scale_prob:
+            image, label = random_res_scale(image, label, rng,
+                                            aug.res_up, aug.res_down)
+        # sdf=None：apply_isometric 显式支持（仅翻转/旋转，无 SDF 可转）
+        image, label, _ = apply_isometric(image, label, None, rng,
+                                          rot90=aug.rot90)
+        if aug.photo_metric:
+            image = photometric_gain(image, rng, aug.photo_gain)
+        image = TF.normalize(image, [0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+        return {'image': image.contiguous(),
+                'label': torch.from_numpy(
+                    np.ascontiguousarray(label)).unsqueeze(0).contiguous()}
+
+
 def run_pass(model, loader, device, optim=None, amp=False, scaler=None,
-             aux_weight=0.3):
+             aux_weight=0.3, abl_weight=0.0):
     """单轮训练/验证；复用 ConfusionMatrix（与主项目同指标口径）。
-    amp 开启时必须配 GradScaler（fp16 梯度下溢防护）。"""
+    amp 开启时必须配 GradScaler（fp16 梯度下溢防护）。
+
+    双输出模型的两种情形按通道数区分（2026-11-05 新增 ABL）：
+      - extra.shape[1] == 1  -> ABL 边界头，用距离加权 BCE（abl_weight）
+      - extra.shape[1] == C  -> UNetFormer 辅助分割头，用 CE（aux_weight）
+    """
     train = optim is not None
     model.train(train)
     cm = ConfusionMatrix(loader.dataset.num_classes, device=device)
@@ -247,12 +404,15 @@ def run_pass(model, loader, device, optim=None, amp=False, scaler=None,
             t = batch['label'].to(device, non_blocking=True)
             with torch.amp.autocast('cuda', enabled=amp):
                 out = model(x)
-                if isinstance(out, tuple):      # UNetFormer: (main, aux)
-                    logits, aux = out
+                if isinstance(out, tuple):      # (main, aux/boundary)
+                    logits, extra = out
                     loss = F.cross_entropy(logits, t.squeeze(1).long())
-                    if aux_weight > 0:
+                    if extra.shape[1] == 1:
+                        if abl_weight > 0:
+                            loss = loss + abl_weight * abl_loss(extra, t)
+                    elif aux_weight > 0:
                         loss = loss + aux_weight * F.cross_entropy(
-                            aux, t.squeeze(1).long())
+                            extra, t.squeeze(1).long())
                 else:
                     logits = out
                     loss = F.cross_entropy(logits, t.squeeze(1).long())
@@ -289,7 +449,8 @@ def eval_test(model, dataset, device, num_classes, batch, workers,
     for batch_ in tqdm(loader, dynamic_ncols=True, leave=False, desc='test'):
         x = batch_['image'].to(device, non_blocking=True)
         t = batch_['label'].to(device, non_blocking=True)
-        logits = model(x)
+        out = model(x)
+        logits = out[0] if isinstance(out, tuple) else out
         cm.update_from_logits(logits, t)
         pred = logits.argmax(1)
         for i in range(x.size(0)):
@@ -346,16 +507,40 @@ def main(args):
     ti, tg = sub('train')
     vi, vg = sub('val')
     # 训练集：FlipTrainSet = 无 SDF 路径 + 随机翻转（E0' 口径同分布）；
+    # AugTrainSet（批 B / P2-2）= 无 SDF 路径 + 与 train.py 同分布的完整
+    # 增强——回答评审 DA-C2"对比方法获得同等增强后边际还剩多少"；
     # 验证/测试：mode='test'（干净、无 SDF）
-    train_set = FlipTrainSet('', '', 1024, mode='test',
-                             num_classes=args.num_classes,
-                             image_list=ti, gt_list=tg)
+    augment = None
+    if args.augment:
+        augment = AugmentConfig(
+            mosaic=args.mosaic, mosaic_prob=args.mosaic_prob,
+            mosaic_close_epochs=args.mosaic_close_epochs,
+            mosaic_open_epoch=args.mosaic_open_epoch,
+            mosaic_scale=tuple(args.mosaic_scale),
+            copy_paste=args.copy_paste, copy_paste_prob=args.copy_paste_prob,
+            res_scale=args.res_scale, res_scale_prob=args.res_scale_prob,
+            res_up=1.25, res_down=0.8, rot90=args.rot90,
+            photo_metric=args.photo_metric,
+            photo_gain=tuple(args.photo_gain))
+        if args.mosaic_open_epoch > args.epoch - args.mosaic_close_epochs:
+            raise SystemExit(
+                f"--mosaic_open_epoch({args.mosaic_open_epoch}) 晚于关闭轮"
+                f"({args.epoch - args.mosaic_close_epochs})，Mosaic 永不启用")
+    if augment is not None:
+        train_set = AugTrainSet('', '', 1024, num_classes=args.num_classes,
+                                image_list=ti, gt_list=tg, augment=augment)
+    else:
+        train_set = FlipTrainSet('', '', 1024, mode='test',
+                                 num_classes=args.num_classes,
+                                 image_list=ti, gt_list=tg)
     val_set = FullDataset('', '', 1024, mode='test',
                           num_classes=args.num_classes,
                           image_list=vi, gt_list=vg)
     print(f"[cmp] model={args.model} ({zoo['desc']}) | lr={lr:g} | "
           f"batch={batch} | wd={wd:g} | amp={args.amp} | "
           f"train: {len(train_set)} | val: {len(val_set)}")
+    if augment is not None:
+        print(f"[cmp] augment: {augment.summary(args.epoch)}")
 
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -367,7 +552,8 @@ def main(args):
                             num_workers=args.num_workers, pin_memory=True,
                             collate_fn=_collate)
 
-    model = build_model(args.model, args.num_classes).to(device)
+    model = build_model(args.model, args.num_classes,
+                        abl=args.abl_weight > 0).to(device)
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[cmp] params: total {sum(p.numel() for p in model.parameters())/1e6:.1f}M"
           f" (trainable {n_tr/1e6:.1f}M)")
@@ -387,13 +573,18 @@ def main(args):
 
     best_miou, best_epoch = -1.0, 0
     for epoch in range(args.epoch):
+        # 传播 Mosaic 关闭调度（FlipTrainSet 无 augment 时为无害 no-op；
+        # DataLoader 每轮重建 worker，主进程状态随之传播）
+        train_set.set_epoch(epoch, args.epoch)
         t0 = time.time()
         lr_now = optim.param_groups[0]['lr']
         tr_loss, cm_tr = run_pass(model, train_loader, device, optim=optim,
                                   amp=args.amp, scaler=scaler,
-                                  aux_weight=args.aux_weight)
+                                  aux_weight=args.aux_weight,
+                                  abl_weight=args.abl_weight)
         va_loss, cm_va = run_pass(model, val_loader, device, amp=args.amp,
-                                  aux_weight=args.aux_weight)
+                                  aux_weight=args.aux_weight,
+                                  abl_weight=args.abl_weight)
         sched.step()
         tr, va = cm_tr.summary(), cm_va.summary()
         dt = time.time() - t0
@@ -467,6 +658,37 @@ if __name__ == '__main__':
                     default='background,blue-steel,red-steel,white-steel')
     ap.add_argument('--no-eval_test', dest='eval_test',
                     action='store_false')
+    # ---- 批 B（P2-2，2026-11-04）：完整增强开关组，语义/默认值与
+    # train.py 逐字一致；唯一差别是总开关 --augment 默认 False（保持
+    # 对比方法 flip-only 旧行为，历史 run 复现不受影响）
+    ap.add_argument('--augment', action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help='完整增强总开关（Mosaic9+稀有类Copy-Paste+分辨率'
+                         '模拟+rot90，与 train.py 同分布）；默认 False = '
+                         '旧行为（仅随机翻转）')
+    ap.add_argument('--mosaic', action=argparse.BooleanOptionalAction,
+                    default=True, help='Mosaic9 九图马赛克')
+    ap.add_argument('--mosaic_prob', type=float, default=1.0)
+    ap.add_argument('--mosaic_close_epochs', type=int, default=10,
+                    help='最后 N 轮关闭 Mosaic（FDS full 协议为 50）')
+    ap.add_argument('--mosaic_open_epoch', type=int, default=1)
+    ap.add_argument('--mosaic_scale', type=float, nargs=2, default=[0.7, 1.0])
+    ap.add_argument('--copy_paste', action=argparse.BooleanOptionalAction,
+                    default=True, help='稀有类连通域粘贴')
+    ap.add_argument('--copy_paste_prob', type=float, default=0.3)
+    ap.add_argument('--res_scale', action=argparse.BooleanOptionalAction,
+                    default=True, help='1.25x/0.8x 分辨率模拟')
+    ap.add_argument('--res_scale_prob', type=float, default=0.5)
+    ap.add_argument('--rot90', action=argparse.BooleanOptionalAction,
+                    default=True)
+    ap.add_argument('--photo_metric', action=argparse.BooleanOptionalAction,
+                    default=False)
+    ap.add_argument('--photo_gain', type=float, nargs=2, default=[0.9, 1.1])
+    # ---- P2 边界感知基线（2026-11-05，评审 R1-MAJOR）----
+    ap.add_argument('--abl_weight', type=float, default=0.0,
+                    help='边界感知基线：给 SegFormer-B2 挂边界头并加距离加权 '
+                         'BCE（ABL 简化实现）。0 = 关闭（默认，历史 run 不受 '
+                         '影响）；建议 0.5')
     args = ap.parse_args()
     if args.save_path is None:
         args.save_path = os.path.join('runs', f'cmp_{args.model}')

@@ -134,3 +134,5 @@ roof_v2_ref,sam2unext_ref_gn_e100_lr1e4_fold2,100,results.csv,,0.6691,23,0.6331,
 roof_v2_ref,sam2unext_ref_gn_e100_lr1e4_fold3,100,results.csv,,0.6198,79,0.6037,79,0.6584,0.5146,0.6340,0.5085,eval_test_best.log
 roof_v2_ref,sam2unext_ref_gn_e100_lr1e4_fold4,100,results.csv,,0.6076,16,0.6487,16,0.6653,0.5833,0.5890,0.5270,eval_test_best.log
 potsdam_ref,sam2unext_ref_gn_e30_lr1e4,30,results.csv,,0.7397,26,0.6919,26,0.7510,0.7297,0.7510,0.7297,eval_test_best.log
+roof_v2,fds_unext_nosup_e100_lr3e5_fold0,100,results.csv,"P0-1A pure region loss (SDF off via warmup>=E; aux_weight 0; weit_coeff 0), arch fully on",0.7141,62,,,0.7321,0.7618,,,eval_test_best.log
+roof_v2,fds_unext_nosup_e100_lr3e5_fold1,100,results.csv,"P0-1A pure region loss (SDF off via warmup>=E; aux_weight 0; weit_coeff 0), arch fully on",0.6657,55,,,0.7282,0.7527,,,eval_test_best.log

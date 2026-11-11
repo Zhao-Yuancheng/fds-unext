@@ -1,13 +1,14 @@
 # FDS-UNeXT
 
-Code for the paper **"Boundary-Aware Adaptation of Frozen Foundation Models for
-Fine-Grained Rooftop Segmentation"** (submitted to *Remote Sensing*).
+Code for the paper **"Boundary Fidelity in Frozen Foundation-Model Adaptation:
+When It Holds and When It Fails for Fine-Grained Rooftop Segmentation"**
+(submitted to *Remote Sensing*).
 
 FDS-UNeXT turns two frozen foundation models, the SAM 2.1 Hiera-L image encoder
 and DINOv2 ViT-L/14, into a four-class rooftop material segmenter with 6.97 M
 trainable parameters (1.33 % of the 523.1 M total). On the Lanzhou Rooftop
-Material Dataset (LRMD, 0.14 m GSD) it reaches 70.00 % mIoU and 72.92 %
-boundary F-score.
+Material Dataset (LRMD, 0.14 m GSD) it reaches **70.00 % mIoU** and
+**68.58 % boundary F-score** (class-equal weighting).
 
 ![Architecture of FDS-UNeXT](assets/architecture.webp)
 
@@ -26,6 +27,22 @@ The four components that carry the result:
 | Boundary supervision | `models/boundary_modules.py` | A boundary attention gate on the shallow skips (fixed Sobel branch × learned attention), a training-only auxiliary boundary head on 3-px bands, and a deformable-convolution refinement before the final upsampling. |
 | Combined loss | `losses/combined_loss.py` | Class-balanced BCE (k = 7) + IoU + SDF boundary term, with an uncertainty-weighted multi-task balance and a Dice-epoch gate. |
 
+## Results
+
+| Dataset | Setting | mIoU (%) | BF (%) |
+|---|---|---|---|
+| LRMD | five folds, 0.14 m | 70.00 ± 6.58 | 68.58 ± 5.08 |
+| Potsdam | two seeds, 0.05 m | 75.56 ± 0.49 | 73.18 ± 0.65 |
+| E-GCS | three seeds, 0.3 m | 95.15 ± 0.37 | 73.05 ± 1.30 |
+
+All BF values use **class-equal weighting** (per-class mean over images, then
+mean over classes) and an 8-pixel tolerance. Do not compare them with
+element-weighted BF from earlier releases (Potsdam seed 42: 73.14; E-GCS
+three-seed: 76.17 ± 0.59); the two conventions must not be mixed or subtracted.
+Under protocol matching, the region margin over SegFormer-B2 disappears and the
+LRMD boundary margin narrows from 7.47 to 2.44 points; see the paper for the
+conditional reading.
+
 ## Repository layout
 
 ```
@@ -40,7 +57,8 @@ eval.py          test-set evaluation (mIoU, per-class IoU, boundary F-score)
 train_compare.py comparators (U-Net, U-Net++, Attention U-Net, DeepLabV3+,
                  SegFormer-B2, HRNet-W32, UNetFormer-R18)
 eval_ref.py      evaluation of the official SAM2-UNeXT baseline
-tools/           boundary IoU / HD95, throughput, qualitative and error maps
+tools/           boundary IoU / HD95, throughput, qualitative and error maps,
+                 checkpoint export/merge
 sam2/, sam2_configs/   minimal vendored SAM 2 package (Apache-2.0)
 assets/          architecture figure shown above
 ```
@@ -144,25 +162,62 @@ python eval.py \
 ```
 
 The paper reports the boundary F-score with an **8-pixel tolerance**, which is
-not the default of `eval.py` (2 px). Boundary IoU, HD95 and the penalized HD95
-variant come from `tools/b2_boundary_metrics.py` with `--group roof_fds`.
+also the default of `eval.py`; pass `--bf_tolerance 8` explicitly to keep the
+protocol visible. Boundary IoU, HD95 and the penalized HD95 variant come from
+`tools/b2_boundary_metrics.py` with `--group roof_fds`.
 
 ## Reproducing the tables and figures
 
 | Paper item | How |
 |---|---|
-| Table of per-fold LRMD scores | `train.py` + `eval.py` per fold, aggregate the `test_metrics.json` files |
+| Table 3, per-fold LRMD scores | `train.py` + `eval.py` per fold, aggregate the `test_metrics.json` files |
+| Table 4, Potsdam / E-GCS | same scripts with the public splits; seeds 42/3407 (Potsdam) and 42/3407/666 (E-GCS) |
 | Comparator table | `train_compare.py --model <name> --split_path ...` (it trains and evaluates in one run; boundary F-score tolerance is 8 px by default here) |
 | Official SAM2-UNeXT baseline | `train_ref.py` and `eval_ref.py` (GroupNorm instead of BatchNorm, K-class head, bounded residual adapter) |
 | Module ablation (Table 5) | `train.py` with `--no-use_fdm`, `--no-use_dysample`, `--no-use_ba`, `--no-use_boundary_head`, `--no-use_dcn`, each over five folds |
+| Single-stream ablation (Table S1) | `train.py --no-use_dino --no-use_fdm` (SAM2-only) or `--no-use_sam --no-use_fdm` (DINOv2-only) |
+| Boundary-supervision ablation | `train.py --warmup_epochs 100 --aux_boundary_weight 0 --weit_coeff 0` (SDF off, auxiliary head off, boundary weighting off) |
 | Tanh-bound ablation | `train_notanh.py` and `eval_notanh.py`, which build `models/fds_unext_notanh.py` (unbounded adapter residual) |
 | Boundary IoU / HD95 (Table 6) | `tools/b2_boundary_metrics.py` |
-| Throughput spectrum (Figure 8) | `tools/a1_efficiency.py` |
-| Qualitative and error maps | `tools/a2_qualitative.py`, `tools/a3_representative.py` |
+| Throughput spectrum (Figure 6) | `tools/a1_efficiency.py` |
+| Qualitative and error maps (Figures 8, 9 and S2) | `tools/a2_qualitative.py`, `tools/a3_representative.py` |
 
-`results/run_summary.csv` aggregates every run behind the paper (validation and
-test mIoU / boundary F-score per fold, run name, and which log the numbers were
+`results/run_summary.csv` aggregates the runs behind the paper (validation and
+test mIoU / boundary F-score per run, run name, and which log the numbers were
 taken from).
+
+## Pre-trained checkpoints
+
+The ten checkpoints behind the tables are published on Hugging Face as
+**trainable-only** files of about 28 MB each, rather than the 2.0 GB full
+checkpoints. A trained model holds 523.1 M parameters, of which the 516.2 M
+frozen-trunk parameters are exactly the public SAM 2.1 and DINOv2 weights, so
+only the 6.97 M parameters that the optimizer updated are stored.
+
+Model hub: `https://huggingface.co/Jim-myoenk/FDS-UNeXT`
+
+| file | trained on | used for |
+|---|---|---|
+| `lrmd-fold0.pth` … `lrmd-fold4.pth` | LRMD, five folds | Table 3, Figures 2 and 5 |
+| `potsdam-seed42.pth`, `potsdam-seed3407.pth` | Potsdam | Table 4, Figure 9a |
+| `egcs-seed42.pth`, `egcs-seed3407.pth`, `egcs-seed666.pth` | E-GCS | Table 4, Figures 3 and 9b |
+
+Rebuild a full checkpoint that `eval.py` can read:
+
+```bash
+# download one delta
+hf download Jim-myoenk/FDS-UNeXT lrmd-fold0.pth --local-dir deltas
+
+python tools/merge_trainable.py \
+  --delta deltas/lrmd-fold0.pth \
+  --hiera_path weights/sam2.1_hiera_large.pt \
+  --dinov2_path weights/dinov2_vitl14_pretrain.pth \
+  --out runs/fold0/FDS-UNeXT-best.pth
+```
+
+The round trip is exact: exporting and re-merging a checkpoint reproduces every
+tensor of the original file. `tools/export_trainable.py` performs the reverse
+direction and is what produced the published deltas.
 
 ## Implementation notes
 
@@ -193,10 +248,11 @@ frozen trunks come from Meta AI and are distributed under the same license; see
 
 ```bibtex
 @article{zhao2026fdsunext,
-  title   = {Boundary-Aware Adaptation of Frozen Foundation Models for
-             Fine-Grained Rooftop Segmentation},
+  title   = {Boundary Fidelity in Frozen Foundation-Model Adaptation: When It
+             Holds and When It Fails for Fine-Grained Rooftop Segmentation},
   author  = {Zhao, Yuancheng and Wang, Jie and Li, Faguo and Liu, Erte and
-             Meng, Xiangying and Chen, Yueyue},
+             Meng, Xiangying and Chen, Yueyue and Yang, Jiapeng and
+             Zhou, Yibo and Li, Qingxue},
   journal = {Remote Sensing},
   year    = {2026},
   note    = {Under review}
