@@ -18,7 +18,7 @@ four FDM blocks, the DySample units, the two boundary attention gates, the
 U-Net decoder, the deformable-convolution refinement, and the segmentation head
 are trained.*
 
-The four components that carry the result:
+Four components define the pipeline:
 
 | Component | Module | What it replaces / adds |
 |---|---|---|
@@ -26,6 +26,13 @@ The four components that carry the result:
 | DySample | `models/dysample.py` | Replaces every bilinear upsampling in the decoder with content-aware resampling (zero-initialized offset and scope heads, bounded offsets `T·tanh(o/T)`). |
 | Boundary supervision | `models/boundary_modules.py` | A boundary attention gate on the shallow skips (fixed Sobel branch × learned attention), a training-only auxiliary boundary head on 3-px bands, and a deformable-convolution refinement before the final upsampling. |
 | Combined loss | `losses/combined_loss.py` | Class-balanced BCE (k = 7) + IoU + SDF boundary term, with an uncertainty-weighted multi-task balance and a Dice-epoch gate. |
+
+The ablation does **not** credit all four with the comparison margin. Removing
+the boundary supervision, the three boundary branches, or both together leaves
+both metrics within the fold-to-fold spread; DySample is the one architectural
+component whose removal is resolved by five folds (BF −2.38, same sign on all
+five folds). The paper therefore attributes the margin to the recipe as a
+whole, not to a single module.
 
 ## Results
 
@@ -40,8 +47,10 @@ mean over classes) and an 8-pixel tolerance. Do not compare them with
 element-weighted BF from earlier releases (Potsdam seed 42: 73.14; E-GCS
 three-seed: 76.17 ± 0.59); the two conventions must not be mixed or subtracted.
 Under protocol matching, the region margin over SegFormer-B2 disappears and the
-LRMD boundary margin narrows from 7.47 to 2.44 points; see the paper for the
-conditional reading.
+LRMD boundary margin narrows from 7.47 to 2.44 points; adding the same boundary
+loss to that comparator gives 1.73, and transplanting DySample into it lowers
+its BF by 4.39 points over five folds. See the paper for the conditional
+reading.
 
 ## Repository layout
 
@@ -87,9 +96,11 @@ Only the two trunks are loaded; no pretrained segmentation head is used.
 
 ## Data
 
-**LRMD is not redistributed.** The imagery comes from a public web mapping
-service whose terms do not allow redistribution, so this repository ships code
-and split definitions only. The four labels are
+**LRMD is not redistributed.** The imagery comes from a commercial
+very-high-resolution optical mosaic whose terms do not allow redistribution, so
+this repository ships code and split definitions only. The annotations, when
+released, use the MIT license; the code and weights use Apache-2.0. The four
+labels are
 
 | value | class | albedo prior |
 |---|---|---|
@@ -174,7 +185,7 @@ protocol visible. Boundary IoU, HD95 and the penalized HD95 variant come from
 | Table 4, Potsdam / E-GCS | same scripts with the public splits; seeds 42/3407 (Potsdam) and 42/3407/666 (E-GCS) |
 | Comparator table | `train_compare.py --model <name> --split_path ...` (it trains and evaluates in one run; boundary F-score tolerance is 8 px by default here) |
 | Official SAM2-UNeXT baseline | `train_ref.py` and `eval_ref.py` (GroupNorm instead of BatchNorm, K-class head, bounded residual adapter) |
-| Module ablation (Table 5) | `train.py` with `--no-use_fdm`, `--no-use_dysample`, `--no-use_ba`, `--no-use_boundary_head`, `--no-use_dcn`, each over five folds |
+| Module ablation (Table 5) | `train.py` with `--no-use_fdm`, `--no-use_dysample`, or the three boundary-branch flags together (`--no-use_ba --no-use_boundary_head --no-use_dcn`), each over five folds; the branches were not ablated individually at five folds |
 | Single-stream ablation (Table S1) | `train.py --no-use_dino --no-use_fdm` (SAM2-only) or `--no-use_sam --no-use_fdm` (DINOv2-only) |
 | Boundary-supervision ablation | `train.py --warmup_epochs 100 --aux_boundary_weight 0 --weit_coeff 0` (SDF off, auxiliary head off, boundary weighting off) |
 | Tanh-bound ablation | `train_notanh.py` and `eval_notanh.py`, which build `models/fds_unext_notanh.py` (unbounded adapter residual) |
